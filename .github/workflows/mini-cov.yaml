@@ -1,0 +1,64 @@
+name: Test Code cov for (x86-64)
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+  RUSTFLAGS: "-Cinstrument-coverage"
+#  RUSTFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests'
+#  RUSTDOCFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests'
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    timeout-minutes: 60
+    name: Tests with Codecov (x86-64)
+    runs-on: "garm-jammy-16"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+#      - name: Install Docker
+#        run: |
+#          sudo apt-get update
+#          sudo apt-get -y install ca-certificates curl gnupg
+#          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+#          sudo chmod a+r /usr/share/keyrings/docker-archive-keyring.gpg
+#          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+#          sudo apt-get update
+#          sudo apt install -y docker-ce docker-ce-cli
+      - name: Install Rust toolchain (1.77.0)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.77.0"
+          target: x86_64-unknown-linux-gnu
+          components: cargo, llvm-tools-preview
+      - name: Install Grcov
+        run: cargo install grcov
+#      - name: Build
+#        run: cargo build --all --release --target x86_64-unknown-linux-gnu
+#      - name: Run unit tests
+#        run: scripts/dev_cli.sh tests --unit --libc gnu
+      - name: Run integration tests
+        timeout-minutes: 40
+        run: scripts/dev_cli.sh tests --integration --libc gnu -- -- --skip common_parallel::test_ovs_dpdk --skip common_parallel::test_vdpa_block
+        continue-on-error: true
+      - name: Run Grcov
+        run: grcov . --binary-path target/x86_64-unknown-linux-gnu/release/ -s . -t lcov --branch --ignore-not-existing -o lcov.info
+#        uses: actions-rs/grcov@v0.1
+#        with:
+#          config: .github/grcov.yml
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true
+          fail_ci_if_error: true
