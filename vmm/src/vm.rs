@@ -16,12 +16,13 @@ use crate::config::{
     UserDeviceConfig, ValidationError, VdpaConfig, VmConfig, VsockConfig,
 };
 use crate::config::{NumaConfig, PayloadConfig};
+use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
     CpuElf64Writable, DumpState, Elf64Writable, GuestDebuggable, GuestDebuggableError, NoteDescType,
 };
 use crate::cpu;
-use crate::device_manager::{DeviceManager, DeviceManagerError, PtyPair};
+use crate::device_manager::{DeviceManager, DeviceManagerError};
 use crate::device_tree::DeviceTree;
 #[cfg(feature = "guest_debug")]
 use crate::gdb::{Debuggable, DebuggableError, GdbRequestPayload, GdbResponsePayload};
@@ -322,6 +323,9 @@ pub enum Error {
 
     #[error("Error resuming the VM: {0}")]
     ResumeVm(#[source] hypervisor::HypervisorVmError),
+
+    #[error("Error creating console devices")]
+    CreateConsoleDevices(ConsoleDeviceError),
 }
 pub type Result<T> = result::Result<T, Error>;
 
@@ -484,9 +488,7 @@ impl Vm {
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         activate_evt: EventFd,
         timestamp: Instant,
-        serial_pty: Option<PtyPair>,
-        console_pty: Option<PtyPair>,
-        debug_console_pty: Option<PtyPair>,
+        console_info: Option<ConsoleInfo>,
         console_resize_pipe: Option<File>,
         original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<Snapshot>,
@@ -623,7 +625,6 @@ impl Vm {
             #[cfg(target_arch = "x86_64")]
             io_bus,
             mmio_bus,
-            hypervisor.hypervisor_type(),
             vm.clone(),
             config.clone(),
             memory_manager.clone(),
@@ -644,13 +645,7 @@ impl Vm {
         device_manager
             .lock()
             .unwrap()
-            .create_devices(
-                serial_pty,
-                console_pty,
-                debug_console_pty,
-                console_resize_pipe,
-                original_termios,
-            )
+            .create_devices(console_info, console_resize_pipe, original_termios)
             .map_err(Error::DeviceManager)?;
 
         #[cfg(feature = "tdx")]
@@ -801,9 +796,7 @@ impl Vm {
         seccomp_action: &SeccompAction,
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         activate_evt: EventFd,
-        serial_pty: Option<PtyPair>,
-        console_pty: Option<PtyPair>,
-        debug_console_pty: Option<PtyPair>,
+        console_info: Option<ConsoleInfo>,
         console_resize_pipe: Option<File>,
         original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<Snapshot>,
@@ -881,9 +874,7 @@ impl Vm {
             hypervisor,
             activate_evt,
             timestamp,
-            serial_pty,
-            console_pty,
-            debug_console_pty,
+            console_info,
             console_resize_pipe,
             original_termios,
             snapshot,
@@ -1357,18 +1348,6 @@ impl Vm {
         .map_err(Error::ConfigureSystem)?;
 
         Ok(())
-    }
-
-    pub fn serial_pty(&self) -> Option<PtyPair> {
-        self.device_manager.lock().unwrap().serial_pty()
-    }
-
-    pub fn console_pty(&self) -> Option<PtyPair> {
-        self.device_manager.lock().unwrap().console_pty()
-    }
-
-    pub fn debug_console_pty(&self) -> Option<PtyPair> {
-        self.device_manager.lock().unwrap().debug_console_pty()
     }
 
     pub fn console_resize_pipe(&self) -> Option<Arc<File>> {

@@ -264,7 +264,7 @@ impl DiskConfig for UbuntuDiskConfig {
         fs::File::open(source_file_dir.join("user-data"))
             .unwrap()
             .read_to_string(&mut user_data_string)
-            .expect("Expected reading user-data file in to succeed");
+            .expect("Expected reading user-data file to succeed");
         user_data_string = user_data_string.replace(
             "@DEFAULT_TCP_LISTENER_MESSAGE",
             DEFAULT_TCP_LISTENER_MESSAGE,
@@ -283,7 +283,7 @@ impl DiskConfig for UbuntuDiskConfig {
         fs::File::open(source_file_dir.join("network-config"))
             .unwrap()
             .read_to_string(&mut network_config_string)
-            .expect("Expected reading network-config file in to succeed");
+            .expect("Expected reading network-config file to succeed");
 
         network_config_string = network_config_string.replace("192.168.2.1", &network.host_ip);
         network_config_string = network_config_string.replace("192.168.2.2", &network.guest_ip);
@@ -795,6 +795,22 @@ pub fn check_matched_lines_count(input: &str, keywords: Vec<&str>, line_count: u
         );
 
         false
+    }
+}
+
+pub fn kill_child(child: &mut Child) {
+    let r = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    if r != 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error().unwrap() == libc::ESRCH {
+            return;
+        }
+        eprintln!("Failed to kill child with SIGTERM: {e:?}");
+    }
+
+    // The timeout period elapsed without the child exiting
+    if child.wait_timeout(Duration::new(5, 0)).unwrap().is_none() {
+        let _ = child.kill();
     }
 }
 
@@ -1622,7 +1638,7 @@ pub fn measure_virtio_net_throughput(
         }
 
         if !failed {
-            // Safe to unwrap as we know the child has terminated succesffully
+            // Safe to unwrap as we know the child has terminated successfully
             let output = c.wait_with_output().unwrap();
             results.push(parse_iperf3_output(&output.stdout, receive, bandwidth)?);
         } else {

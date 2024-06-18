@@ -28,6 +28,7 @@ use anyhow::anyhow;
 #[cfg(feature = "dbus_api")]
 use api::dbus::{DBusApiOptions, DBusApiShutdownChannels};
 use api::http::HttpApiHandle;
+use console_devices::{pre_create_console_devices, ConsoleInfo};
 use libc::{tcsetattr, termios, EFD_NONBLOCK, SIGINT, SIGTERM, TCSANOW};
 use memory_manager::MemoryManagerSnapshotData;
 use pci::PciBdf;
@@ -63,6 +64,7 @@ mod acpi;
 pub mod api;
 mod clone3;
 pub mod config;
+pub mod console_devices;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 mod coredump;
 pub mod cpu;
@@ -548,6 +550,8 @@ pub struct Vmm {
     signals: Option<Handle>,
     threads: Vec<thread::JoinHandle<()>>,
     original_termios_opt: Arc<Mutex<Option<termios>>>,
+    console_resize_pipe: Option<File>,
+    console_info: Option<ConsoleInfo>,
 }
 
 impl Vmm {
@@ -682,6 +686,8 @@ impl Vmm {
             signals: None,
             threads: vec![],
             original_termios_opt: Arc::new(Mutex::new(None)),
+            console_resize_pipe: None,
+            console_info: None,
         })
     }
 
@@ -714,6 +720,9 @@ impl Vmm {
 
         let config = vm_migration_config.vm_config.clone();
         self.vm_config = Some(vm_migration_config.vm_config);
+        self.console_info = Some(pre_create_console_devices(self).map_err(|e| {
+            MigratableError::MigrateReceive(anyhow!("Error creating console devices: {:?}", e))
+        })?);
 
         let vm = Vm::create_hypervisor_vm(
             &self.hypervisor,
@@ -803,9 +812,7 @@ impl Vmm {
             self.hypervisor.clone(),
             activate_evt,
             timestamp,
-            None,
-            None,
-            None,
+            self.console_info.clone(),
             None,
             Arc::clone(&self.original_termios_opt),
             Some(snapshot),
@@ -1208,6 +1215,8 @@ impl RequestHandler for Vmm {
         // The VM will be created when being asked to boot it.
         if self.vm_config.is_none() {
             self.vm_config = Some(config);
+            self.console_info =
+                Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
             Ok(())
         } else {
             Err(VmError::VmAlreadyCreated)
@@ -1220,10 +1229,16 @@ impl RequestHandler for Vmm {
         event!("vm", "booting");
         let r = {
             trace_scoped!("vm_boot");
-            // If we don't have a config, we can not boot a VM.
+            // If we don't have a config, we cannot boot a VM.
             if self.vm_config.is_none() {
                 return Err(VmError::VmMissingConfig);
             };
+
+            // console_info is set to None in vm_shutdown. re-populate here if empty
+            if self.console_info.is_none() {
+                self.console_info =
+                    Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
+            }
 
             // Create a new VM if we don't have one yet.
             if self.vm.is_none() {
@@ -1249,9 +1264,7 @@ impl RequestHandler for Vmm {
                         &self.seccomp_action,
                         self.hypervisor.clone(),
                         activate_evt,
-                        None,
-                        None,
-                        None,
+                        self.console_info.clone(),
                         None,
                         Arc::clone(&self.original_termios_opt),
                         None,
@@ -1295,6 +1308,8 @@ impl RequestHandler for Vmm {
 
     fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
+            // Drain console_info so that FDs are not reused
+            let _ = self.console_info.take();
             vm.snapshot()
                 .map_err(VmError::Snapshot)
                 .and_then(|snapshot| {
@@ -1349,6 +1364,12 @@ impl RequestHandler for Vmm {
 
         self.vm_config = Some(Arc::clone(&vm_config));
 
+        // console_info is set to None in vm_snapshot. re-populate here if empty
+        if self.console_info.is_none() {
+            self.console_info =
+                Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
+        }
+
         let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
         let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
         #[cfg(feature = "guest_debug")]
@@ -1370,9 +1391,7 @@ impl RequestHandler for Vmm {
             &self.seccomp_action,
             self.hypervisor.clone(),
             activate_evt,
-            None,
-            None,
-            None,
+            self.console_info.clone(),
             None,
             Arc::clone(&self.original_termios_opt),
             Some(snapshot),
@@ -1400,6 +1419,8 @@ impl RequestHandler for Vmm {
 
     fn vm_shutdown(&mut self) -> result::Result<(), VmError> {
         let r = if let Some(ref mut vm) = self.vm.take() {
+            // Drain console_info so that the FDs are not reused
+            let _ = self.console_info.take();
             vm.shutdown()
         } else {
             Err(VmError::VmNotRunning)
@@ -1416,27 +1437,21 @@ impl RequestHandler for Vmm {
         event!("vm", "rebooting");
 
         // First we stop the current VM
-        let (config, serial_pty, console_pty, debug_console_pty, console_resize_pipe) =
-            if let Some(mut vm) = self.vm.take() {
-                let config = vm.get_config();
-                let serial_pty = vm.serial_pty();
-                let console_pty = vm.console_pty();
-                let debug_console_pty = vm.debug_console_pty();
-                let console_resize_pipe = vm
-                    .console_resize_pipe()
-                    .as_ref()
-                    .map(|pipe| pipe.try_clone().unwrap());
-                vm.shutdown()?;
-                (
-                    config,
-                    serial_pty,
-                    console_pty,
-                    debug_console_pty,
-                    console_resize_pipe,
-                )
-            } else {
-                return Err(VmError::VmNotCreated);
-            };
+        let (config, console_resize_pipe) = if let Some(mut vm) = self.vm.take() {
+            let config = vm.get_config();
+            let console_resize_pipe = vm
+                .console_resize_pipe()
+                .as_ref()
+                .map(|pipe| pipe.try_clone().unwrap());
+            vm.shutdown()?;
+            (config, console_resize_pipe)
+        } else {
+            return Err(VmError::VmNotCreated);
+        };
+
+        // vm.shutdown() closes all the console devices, so set console_info to None
+        // so that the closed FD #s are not reused.
+        let _ = self.console_info.take();
 
         let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
         let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
@@ -1457,6 +1472,9 @@ impl RequestHandler for Vmm {
             warn!("Spurious second reset event received. Ignoring.");
         }
 
+        self.console_info =
+            Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
+
         // Then we create the new VM
         let mut vm = Vm::new(
             config,
@@ -1467,9 +1485,7 @@ impl RequestHandler for Vmm {
             &self.seccomp_action,
             self.hypervisor.clone(),
             activate_evt,
-            serial_pty,
-            console_pty,
-            debug_console_pty,
+            self.console_info.clone(),
             console_resize_pipe,
             Arc::clone(&self.original_termios_opt),
             None,

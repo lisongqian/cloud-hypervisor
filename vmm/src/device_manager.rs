@@ -13,15 +13,14 @@ use crate::config::{
     ConsoleOutputMode, DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, UserDeviceConfig,
     VdpaConfig, VhostMode, VmConfig, VsockConfig,
 };
+use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 use crate::cpu::{CpuManager, CPU_MANAGER_ACPI_SIZE};
 use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::LegacyUserspaceInterruptManager;
 use crate::interrupt::MsiInterruptManager;
 use crate::memory_manager::{Error as MemoryManagerError, MemoryManager, MEMORY_MANAGER_ACPI_SIZE};
 use crate::pci_segment::PciSegment;
-use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
-use crate::sigwinch_listener::start_sigwinch_listener;
 use crate::vm_config::DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT;
 use crate::GuestRegionMmap;
 use crate::PciDeviceInfo;
@@ -53,10 +52,10 @@ use devices::legacy::Pl011;
 use devices::{
     interrupt_controller, interrupt_controller::InterruptController, AcpiNotificationFlags,
 };
-use hypervisor::{HypervisorType, IoEventAddress};
+use hypervisor::IoEventAddress;
 use libc::{
-    cfmakeraw, isatty, tcgetattr, tcsetattr, termios, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED,
-    O_TMPFILE, PROT_READ, PROT_WRITE, TCSANOW,
+    tcsetattr, termios, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, O_TMPFILE, PROT_READ, PROT_WRITE,
+    TCSANOW,
 };
 use pci::{
     DeviceRelocation, MmioRegion, PciBarRegionType, PciBdf, PciDevice, VfioDmaMapping,
@@ -66,12 +65,12 @@ use rate_limiter::group::RateLimiterGroup;
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{read_link, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, stdout, Seek, SeekFrom};
-use std::mem::zeroed;
 use std::num::Wrapping;
+use std::os::fd::RawFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, Mutex};
@@ -270,7 +269,7 @@ pub enum DeviceManagerError {
     DebugconPtyOpen(io::Error),
 
     /// Error setting pty raw mode
-    SetPtyRaw(vmm_sys_util::errno::Error),
+    SetPtyRaw(ConsoleDeviceError),
 
     /// Error getting pty peer
     GetPtyPeer(vmm_sys_util::errno::Error),
@@ -494,60 +493,20 @@ pub enum DeviceManagerError {
 
     /// Cannot create a RateLimiterGroup
     RateLimiterGroupCreate(rate_limiter::group::Error),
+
+    /// Cannot start sigwinch listener
+    StartSigwinchListener(std::io::Error),
+
+    // Invalid console info
+    InvalidConsoleInfo,
+
+    // Invalid console fd
+    InvalidConsoleFd,
 }
 
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
 
 const DEVICE_MANAGER_ACPI_SIZE: usize = 0x10;
-
-const TIOCSPTLCK: libc::c_int = 0x4004_5431;
-const TIOCGTPEER: libc::c_int = 0x5441;
-
-pub fn create_pty() -> io::Result<(File, File, PathBuf)> {
-    // Try to use /dev/pts/ptmx first then fall back to /dev/ptmx
-    // This is done to try and use the devpts filesystem that
-    // could be available for use in the process's namespace first.
-    // Ideally these are all the same file though but different
-    // kernels could have things setup differently.
-    // See https://www.kernel.org/doc/Documentation/filesystems/devpts.txt
-    // for further details.
-
-    let custom_flags = libc::O_NONBLOCK;
-    let main = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(custom_flags)
-        .open("/dev/pts/ptmx")
-    {
-        Ok(f) => f,
-        _ => OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(custom_flags)
-            .open("/dev/ptmx")?,
-    };
-    let mut unlock: libc::c_ulong = 0;
-    // SAFETY: FFI call into libc, trivially safe
-    unsafe { libc::ioctl(main.as_raw_fd(), TIOCSPTLCK as _, &mut unlock) };
-
-    // SAFETY: FFI call into libc, trivially safe
-    let sub_fd = unsafe {
-        libc::ioctl(
-            main.as_raw_fd(),
-            TIOCGTPEER as _,
-            libc::O_NOCTTY | libc::O_RDWR,
-        )
-    };
-    if sub_fd == -1 {
-        return vmm_sys_util::errno::errno_result().map_err(|e| e.into());
-    }
-
-    let proc_path = PathBuf::from(format!("/proc/self/fd/{sub_fd}"));
-    let path = read_link(proc_path)?;
-
-    // SAFETY: sub_fd is checked to be valid before being wrapped in File
-    Ok((main, unsafe { File::from_raw_fd(sub_fd) }, path))
-}
 
 #[derive(Default)]
 pub struct Console {
@@ -815,23 +774,11 @@ pub struct AcpiPlatformAddresses {
 }
 
 pub struct DeviceManager {
-    // The underlying hypervisor
-    hypervisor_type: HypervisorType,
-
     // Manage address space related to devices
     address_manager: Arc<AddressManager>,
 
     // Console abstraction
     console: Arc<Console>,
-
-    // console PTY
-    console_pty: Option<Arc<Mutex<PtyPair>>>,
-
-    // serial PTY
-    serial_pty: Option<Arc<Mutex<PtyPair>>>,
-
-    // debug-console PTY
-    debug_console_pty: Option<Arc<Mutex<PtyPair>>>,
 
     // Serial Manager
     serial_manager: Option<Arc<SerialManager>>,
@@ -1003,7 +950,6 @@ impl DeviceManager {
     pub fn new(
         #[cfg(target_arch = "x86_64")] io_bus: Arc<Bus>,
         mmio_bus: Arc<Bus>,
-        hypervisor_type: HypervisorType,
         vm: Arc<dyn hypervisor::Vm>,
         config: Arc<Mutex<VmConfig>>,
         memory_manager: Arc<Mutex<MemoryManager>>,
@@ -1180,7 +1126,6 @@ impl DeviceManager {
         }
 
         let device_manager = DeviceManager {
-            hypervisor_type,
             address_manager: Arc::clone(&address_manager),
             console: Arc::new(Console::default()),
             interrupt_controller: None,
@@ -1214,10 +1159,7 @@ impl DeviceManager {
                 .map_err(DeviceManagerError::EventFd)?,
             acpi_address,
             selected_segment: 0,
-            serial_pty: None,
             serial_manager: None,
-            console_pty: None,
-            debug_console_pty: None,
             console_resize_pipe: None,
             original_termios_opt: Arc::new(Mutex::new(None)),
             virtio_mem_devices: Vec::new(),
@@ -1250,33 +1192,13 @@ impl DeviceManager {
         Ok(device_manager)
     }
 
-    pub fn serial_pty(&self) -> Option<PtyPair> {
-        self.serial_pty
-            .as_ref()
-            .map(|pty| pty.lock().unwrap().clone())
-    }
-
-    pub fn console_pty(&self) -> Option<PtyPair> {
-        self.console_pty
-            .as_ref()
-            .map(|pty| pty.lock().unwrap().clone())
-    }
-
-    pub fn debug_console_pty(&self) -> Option<PtyPair> {
-        self.debug_console_pty
-            .as_ref()
-            .map(|pty| pty.lock().unwrap().clone())
-    }
-
     pub fn console_resize_pipe(&self) -> Option<Arc<File>> {
         self.console_resize_pipe.clone()
     }
 
     pub fn create_devices(
         &mut self,
-        serial_pty: Option<PtyPair>,
-        console_pty: Option<PtyPair>,
-        debug_console_pty: Option<PtyPair>,
+        console_info: Option<ConsoleInfo>,
         console_resize_pipe: Option<File>,
         original_termios_opt: Arc<Mutex<Option<termios>>>,
     ) -> DeviceManagerResult<()> {
@@ -1339,9 +1261,7 @@ impl DeviceManager {
         self.console = self.add_console_devices(
             &legacy_interrupt_manager,
             &mut virtio_devices,
-            serial_pty,
-            console_pty,
-            debug_console_pty,
+            console_info,
             console_resize_pipe,
         )?;
 
@@ -2022,127 +1942,56 @@ impl DeviceManager {
         Ok(serial)
     }
 
-    fn modify_mode<F: FnOnce(&mut termios)>(
-        &mut self,
-        fd: RawFd,
-        f: F,
-    ) -> vmm_sys_util::errno::Result<()> {
-        // SAFETY: safe because we check the return value of isatty.
-        if unsafe { isatty(fd) } != 1 {
-            return Ok(());
-        }
-
-        // SAFETY: The following pair are safe because termios gets totally overwritten by tcgetattr
-        // and we check the return result.
-        let mut termios: termios = unsafe { zeroed() };
-        // SAFETY: see above
-        let ret = unsafe { tcgetattr(fd, &mut termios as *mut _) };
-        if ret < 0 {
-            return vmm_sys_util::errno::errno_result();
-        }
-        let mut original_termios_opt = self.original_termios_opt.lock().unwrap();
-        if original_termios_opt.is_none() {
-            *original_termios_opt = Some(termios);
-        }
-        f(&mut termios);
-        // SAFETY: Safe because the syscall will only read the extent of termios and we check
-        // the return result.
-        let ret = unsafe { tcsetattr(fd, TCSANOW, &termios as *const _) };
-        if ret < 0 {
-            return vmm_sys_util::errno::errno_result();
-        }
-
-        Ok(())
-    }
-
-    fn set_raw_mode(&mut self, f: &dyn AsRawFd) -> vmm_sys_util::errno::Result<()> {
-        // SAFETY: FFI call. Variable t is guaranteed to be a valid termios from modify_mode.
-        self.modify_mode(f.as_raw_fd(), |t| unsafe { cfmakeraw(t) })
-    }
-
-    fn listen_for_sigwinch_on_tty(&mut self, pty_sub: File) -> std::io::Result<()> {
-        let seccomp_filter = get_seccomp_filter(
-            &self.seccomp_action,
-            Thread::PtyForeground,
-            self.hypervisor_type,
-        )
-        .unwrap();
-
-        self.console_resize_pipe =
-            Some(Arc::new(start_sigwinch_listener(seccomp_filter, pty_sub)?));
-
-        Ok(())
-    }
-
     fn add_virtio_console_device(
         &mut self,
         virtio_devices: &mut Vec<MetaVirtioDevice>,
-        console_pty: Option<PtyPair>,
+        console_fd: Option<RawFd>,
         resize_pipe: Option<File>,
     ) -> DeviceManagerResult<Option<Arc<virtio_devices::ConsoleResizer>>> {
         let console_config = self.config.lock().unwrap().console.clone();
         let endpoint = match console_config.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(console_config.file.as_ref().unwrap())
-                    .map_err(DeviceManagerError::ConsoleOutputFileOpen)?;
-                Endpoint::File(file)
+                if let Some(file_fd) = console_fd {
+                    // SAFETY: file_fd is guaranteed to be a valid fd from
+                    // pre_create_console_devices() in vmm/src/console_devices.rs
+                    Endpoint::File(unsafe { File::from_raw_fd(file_fd) })
+                } else {
+                    return Err(DeviceManagerError::InvalidConsoleFd);
+                }
             }
             ConsoleOutputMode::Pty => {
-                if let Some(pty) = console_pty {
-                    self.config.lock().unwrap().console.file = Some(pty.path.clone());
-                    let file = pty.main.try_clone().unwrap();
-                    self.console_pty = Some(Arc::new(Mutex::new(pty)));
+                if let Some(pty_fd) = console_fd {
+                    // SAFETY: pty_fd is guaranteed to be a valid fd from
+                    // pre_create_console_devices() in vmm/src/console_devices.rs
+                    let file = unsafe { File::from_raw_fd(pty_fd) };
                     self.console_resize_pipe = resize_pipe.map(Arc::new);
                     Endpoint::PtyPair(file.try_clone().unwrap(), file)
                 } else {
-                    let (main, sub, path) =
-                        create_pty().map_err(DeviceManagerError::ConsolePtyOpen)?;
-                    self.set_raw_mode(&sub)
-                        .map_err(DeviceManagerError::SetPtyRaw)?;
-                    self.config.lock().unwrap().console.file = Some(path.clone());
-                    let file = main.try_clone().unwrap();
-                    assert!(resize_pipe.is_none());
-                    self.listen_for_sigwinch_on_tty(sub).unwrap();
-                    self.console_pty = Some(Arc::new(Mutex::new(PtyPair { main, path })));
-                    Endpoint::PtyPair(file.try_clone().unwrap(), file)
+                    return Err(DeviceManagerError::InvalidConsoleFd);
                 }
             }
             ConsoleOutputMode::Tty => {
-                // Duplicating the file descriptors like this is needed as otherwise
-                // they will be closed on a reboot and the numbers reused
-
-                // SAFETY: FFI call to dup. Trivially safe.
-                let stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
-                if stdout == -1 {
-                    return vmm_sys_util::errno::errno_result().map_err(DeviceManagerError::DupFd);
-                }
-                // SAFETY: stdout is valid and owned solely by us.
-                let stdout = unsafe { File::from_raw_fd(stdout) };
-
-                // Make sure stdout is in raw mode, if it's a terminal.
-                let _ = self.set_raw_mode(&stdout);
-
-                // SAFETY: FFI call. Trivially safe.
-                if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1 {
-                    self.listen_for_sigwinch_on_tty(stdout.try_clone().unwrap())
-                        .unwrap();
-                }
-
-                // If an interactive TTY then we can accept input
-                // SAFETY: FFI call. Trivially safe.
-                if unsafe { libc::isatty(libc::STDIN_FILENO) == 1 } {
-                    // SAFETY: FFI call to dup. Trivially safe.
-                    let stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
-                    if stdin == -1 {
-                        return vmm_sys_util::errno::errno_result()
-                            .map_err(DeviceManagerError::DupFd);
+                if let Some(tty_fd) = console_fd {
+                    // SAFETY: tty_fd is guaranteed to be a valid fd from
+                    // pre_create_console_devices() in vmm/src/console_devices.rs
+                    let stdout = unsafe { File::from_raw_fd(tty_fd) };
+                    // If an interactive TTY then we can accept input
+                    // SAFETY: FFI call. Trivially safe.
+                    if unsafe { libc::isatty(libc::STDIN_FILENO) == 1 } {
+                        // SAFETY: FFI call to dup. Trivially safe.
+                        let stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
+                        if stdin == -1 {
+                            return vmm_sys_util::errno::errno_result()
+                                .map_err(DeviceManagerError::DupFd);
+                        }
+                        // SAFETY: stdin is valid and owned solely by us.
+                        let stdin = unsafe { File::from_raw_fd(stdin) };
+                        Endpoint::FilePair(stdout, stdin)
+                    } else {
+                        Endpoint::File(stdout)
                     }
-                    // SAFETY: stdin is valid and owned solely by us.
-                    let stdin = unsafe { File::from_raw_fd(stdin) };
-
-                    Endpoint::FilePair(stdout, stdin)
                 } else {
-                    Endpoint::File(stdout)
+                    return Err(DeviceManagerError::InvalidConsoleFd);
                 }
             }
             ConsoleOutputMode::Socket => {
@@ -2203,38 +2052,32 @@ impl DeviceManager {
         &mut self,
         interrupt_manager: &Arc<dyn InterruptManager<GroupConfig = LegacyIrqGroupConfig>>,
         virtio_devices: &mut Vec<MetaVirtioDevice>,
-        serial_pty: Option<PtyPair>,
-        console_pty: Option<PtyPair>,
-        #[cfg(target_arch = "x86_64")] debug_console_pty: Option<PtyPair>,
-        #[cfg(not(target_arch = "x86_64"))] _: Option<PtyPair>,
+        console_info: Option<ConsoleInfo>,
         console_resize_pipe: Option<File>,
     ) -> DeviceManagerResult<Arc<Console>> {
         let serial_config = self.config.lock().unwrap().serial.clone();
+        if console_info.is_none() {
+            return Err(DeviceManagerError::InvalidConsoleInfo);
+        }
+
+        // SAFETY: console_info is Some, so it's safe to unwrap.
+        let console_info = console_info.unwrap();
         let serial_writer: Option<Box<dyn io::Write + Send>> = match serial_config.mode {
-            ConsoleOutputMode::File => Some(Box::new(
-                File::create(serial_config.file.as_ref().unwrap())
-                    .map_err(DeviceManagerError::SerialOutputFileOpen)?,
-            )),
-            ConsoleOutputMode::Pty => {
-                if let Some(pty) = serial_pty.clone() {
-                    self.config.lock().unwrap().serial.file = Some(pty.path.clone());
-                    self.serial_pty = Some(Arc::new(Mutex::new(pty)));
-                } else {
-                    let (main, sub, path) =
-                        create_pty().map_err(DeviceManagerError::SerialPtyOpen)?;
-                    self.set_raw_mode(&sub)
-                        .map_err(DeviceManagerError::SetPtyRaw)?;
-                    self.config.lock().unwrap().serial.file = Some(path.clone());
-                    self.serial_pty = Some(Arc::new(Mutex::new(PtyPair { main, path })));
+            ConsoleOutputMode::File | ConsoleOutputMode::Tty => {
+                if console_info.serial_main_fd.is_none() {
+                    return Err(DeviceManagerError::InvalidConsoleInfo);
                 }
-                None
+                // SAFETY: serial_main_fd is Some, so it's safe to unwrap.
+                // SAFETY: serial_main_fd is guaranteed to be a valid fd from
+                // pre_create_console_devices() in vmm/src/console_devices.rs
+                Some(Box::new(unsafe {
+                    File::from_raw_fd(console_info.serial_main_fd.unwrap())
+                }))
             }
-            ConsoleOutputMode::Tty => {
-                let out = stdout();
-                let _ = self.set_raw_mode(&out);
-                Some(Box::new(out))
-            }
-            ConsoleOutputMode::Off | ConsoleOutputMode::Null | ConsoleOutputMode::Socket => None,
+            ConsoleOutputMode::Off
+            | ConsoleOutputMode::Null
+            | ConsoleOutputMode::Pty
+            | ConsoleOutputMode::Socket => None,
         };
         if serial_config.mode != ConsoleOutputMode::Off {
             let serial = self.add_serial_device(interrupt_manager, serial_writer)?;
@@ -2242,7 +2085,7 @@ impl DeviceManager {
                 ConsoleOutputMode::Pty | ConsoleOutputMode::Tty | ConsoleOutputMode::Socket => {
                     let serial_manager = SerialManager::new(
                         serial,
-                        self.serial_pty.clone(),
+                        console_info.serial_main_fd,
                         serial_config.mode,
                         serial_config.socket,
                     )
@@ -2267,43 +2110,34 @@ impl DeviceManager {
         #[cfg(target_arch = "x86_64")]
         {
             let debug_console_config = self.config.lock().unwrap().debug_console.clone();
-            let debug_console_writer: Option<Box<dyn io::Write + Send>> = match debug_console_config
-                .mode
-            {
-                ConsoleOutputMode::File => Some(Box::new(
-                    File::create(debug_console_config.file.as_ref().unwrap())
-                        .map_err(DeviceManagerError::DebugconOutputFileOpen)?,
-                )),
-                ConsoleOutputMode::Pty => {
-                    if let Some(pty) = debug_console_pty {
-                        self.config.lock().unwrap().debug_console.file = Some(pty.path.clone());
-                        self.debug_console_pty = Some(Arc::new(Mutex::new(pty)));
-                    } else {
-                        let (main, sub, path) =
-                            create_pty().map_err(DeviceManagerError::DebugconPtyOpen)?;
-                        self.set_raw_mode(&sub)
-                            .map_err(DeviceManagerError::SetPtyRaw)?;
-                        self.config.lock().unwrap().debug_console.file = Some(path.clone());
-                        self.debug_console_pty = Some(Arc::new(Mutex::new(PtyPair { main, path })));
+            let debug_console_writer: Option<Box<dyn io::Write + Send>> =
+                match debug_console_config.mode {
+                    ConsoleOutputMode::File | ConsoleOutputMode::Tty => {
+                        if console_info.debug_main_fd.is_none() {
+                            return Err(DeviceManagerError::InvalidConsoleInfo);
+                        }
+                        // SAFETY: debug_main_fd is Some, so it's safe to unwrap.
+                        // SAFETY: debug_main_fd is guaranteed to be a valid fd from
+                        // pre_create_console_devices() in vmm/src/console_devices.rs
+                        Some(Box::new(unsafe {
+                            File::from_raw_fd(console_info.debug_main_fd.unwrap())
+                        }))
                     }
-                    None
-                }
-                ConsoleOutputMode::Tty => {
-                    let out = stdout();
-                    let _ = self.set_raw_mode(&out);
-                    Some(Box::new(out))
-                }
-                ConsoleOutputMode::Off | ConsoleOutputMode::Null | ConsoleOutputMode::Socket => {
-                    None
-                }
-            };
+                    ConsoleOutputMode::Off
+                    | ConsoleOutputMode::Null
+                    | ConsoleOutputMode::Pty
+                    | ConsoleOutputMode::Socket => None,
+                };
             if let Some(writer) = debug_console_writer {
                 let _ = self.add_debug_console_device(writer)?;
             }
         }
 
-        let console_resizer =
-            self.add_virtio_console_device(virtio_devices, console_pty, console_resize_pipe)?;
+        let console_resizer = self.add_virtio_console_device(
+            virtio_devices,
+            console_info.console_main_fd,
+            console_resize_pipe,
+        )?;
 
         Ok(Arc::new(Console { console_resizer }))
     }

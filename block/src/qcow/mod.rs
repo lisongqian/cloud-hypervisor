@@ -31,13 +31,16 @@ use vmm_sys_util::{
 
 pub use crate::qcow::raw_file::RawFile;
 
+/// Nesting depth limit for disk formats that can open other disk files.
+const MAX_NESTING_DEPTH: u32 = 10;
+
 #[sorted]
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Backing file io error: {0}")]
     BackingFileIo(io::Error),
     #[error("Backing file open error: {0}")]
-    BackingFileOpen(Box<crate::Error>),
+    BackingFileOpen(Box<Error>),
     #[error("Backing file name is too long: {0} bytes over")]
     BackingFileTooLong(usize),
     #[error("Compressed blocks not supported")]
@@ -70,6 +73,8 @@ pub enum Error {
     InvalidRefcountTableOffset,
     #[error("Invalid refcount table size: {0}")]
     InvalidRefcountTableSize(u64),
+    #[error("Maximum disk nesting depth exceeded")]
+    MaxNestingDepthExceeded,
     #[error("No free clusters")]
     NoFreeClusters,
     #[error("No refcount clusters")]
@@ -434,12 +439,20 @@ pub struct QcowFile {
     // List of unreferenced clusters available to be used. unref clusters become available once the
     // removal of references to them have been synced to disk.
     avail_clusters: Vec<u64>,
-    backing_file: Option<Box<dyn BlockBackend>>,
+    backing_file: Option<Box<Self>>,
 }
 
 impl QcowFile {
     /// Creates a QcowFile from `file`. File must be a valid qcow2 image.
-    pub fn from(mut file: RawFile) -> Result<QcowFile> {
+    ///
+    /// Additionally, max nesting depth of this qcow2 image will be set to default value 10.
+    pub fn from(file: RawFile) -> Result<QcowFile> {
+        Self::from_with_nesting_depth(file, MAX_NESTING_DEPTH)
+    }
+
+    /// Creates a QcowFile from `file` and with a max nesting depth. File must be a valid qcow2
+    /// image.
+    pub fn from_with_nesting_depth(mut file: RawFile, max_nesting_depth: u32) -> Result<QcowFile> {
         let header = QcowHeader::new(&mut file)?;
 
         // Only v2 and v3 files are supported.
@@ -466,14 +479,20 @@ impl QcowFile {
         let direct_io = file.is_direct();
 
         let backing_file = if let Some(backing_file_path) = header.backing_file_path.as_ref() {
+            if max_nesting_depth == 0 {
+                return Err(Error::MaxNestingDepthExceeded);
+            }
             let path = backing_file_path.clone();
             let backing_raw_file = OpenOptions::new()
                 .read(true)
                 .open(path)
                 .map_err(Error::BackingFileIo)?;
-            let backing_file = crate::create_disk_file(backing_raw_file, direct_io)
-                .map_err(|e| Error::BackingFileOpen(Box::new(e)))?;
-            Some(backing_file)
+            let backing_file = Self::from_with_nesting_depth(
+                RawFile::new(backing_raw_file, direct_io),
+                max_nesting_depth - 1,
+            )
+            .map_err(|e| Error::BackingFileOpen(Box::new(e)))?;
+            Some(Box::new(backing_file))
         } else {
             None
         };
@@ -621,20 +640,22 @@ impl QcowFile {
         file: RawFile,
         version: u32,
         backing_file_name: &str,
+        backing_file_max_nesting_depth: u32,
     ) -> Result<QcowFile> {
         let direct_io = file.is_direct();
         let backing_raw_file = OpenOptions::new()
             .read(true)
             .open(backing_file_name)
             .map_err(Error::BackingFileIo)?;
-        let backing_file = crate::create_disk_file(backing_raw_file, direct_io)
-            .map_err(|e| Error::BackingFileOpen(Box::new(e)))?;
-        let size = backing_file
-            .size()
-            .map_err(|e| Error::BackingFileOpen(Box::new(e)))?;
+        let backing_file = Self::from_with_nesting_depth(
+            RawFile::new(backing_raw_file, direct_io),
+            backing_file_max_nesting_depth,
+        )
+        .map_err(|e| Error::BackingFileOpen(Box::new(e)))?;
+        let size = backing_file.virtual_size();
         let header = QcowHeader::create_for_size_and_path(version, size, Some(backing_file_name))?;
         let mut result = QcowFile::new_from_header(file, header)?;
-        result.backing_file = Some(backing_file);
+        result.backing_file = Some(Box::new(backing_file));
         Ok(result)
     }
 
@@ -662,7 +683,7 @@ impl QcowFile {
         Ok(qcow)
     }
 
-    pub fn set_backing_file(&mut self, backing: Option<Box<dyn BlockBackend>>) {
+    pub fn set_backing_file(&mut self, backing: Option<Box<Self>>) {
         self.backing_file = backing;
     }
 
@@ -1200,7 +1221,7 @@ impl QcowFile {
     }
 
     // Allocate and initialize a new data cluster. Returns the offset of the
-    // cluster in to the file on success.
+    // cluster into the file on success.
     fn append_data_cluster(&mut self, initial_data: Option<Vec<u8>>) -> std::io::Result<u64> {
         let new_addr: u64 = self.get_new_cluster(initial_data)?;
         // The cluster refcount starts at one indicating it is used but doesn't need COW.
@@ -1778,11 +1799,17 @@ where
 /// Copy the contents of a disk image in `src_file` into `dst_file`.
 /// The type of `src_file` is automatically detected, and the output file type is
 /// determined by `dst_type`.
-pub fn convert(mut src_file: RawFile, dst_file: RawFile, dst_type: ImageType) -> Result<()> {
+pub fn convert(
+    mut src_file: RawFile,
+    dst_file: RawFile,
+    dst_type: ImageType,
+    src_max_nesting_depth: u32,
+) -> Result<()> {
     let src_type = detect_image_type(&mut src_file)?;
     match src_type {
         ImageType::Qcow2 => {
-            let mut src_reader = QcowFile::from(src_file)?;
+            let mut src_reader =
+                QcowFile::from_with_nesting_depth(src_file, src_max_nesting_depth)?;
             convert_reader(&mut src_reader, dst_file, dst_type)
         }
         ImageType::Raw => {
@@ -1811,6 +1838,9 @@ pub fn detect_image_type(file: &mut RawFile) -> Result<ImageType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::path::Path;
+    use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
     use vmm_sys_util::write_zeroes::WriteZeroes;
 
@@ -2008,6 +2038,82 @@ mod tests {
             Some(String::from("/my/path/to/a/file"))
         );
         assert_eq!(read_header.backing_file_path, header.backing_file_path);
+    }
+
+    #[test]
+    fn no_backing_file() {
+        // `backing_file` is `None`
+        let header = QcowHeader::create_for_size_and_path(3, 0x10_0000, None)
+            .expect("Failed to create header.");
+        let mut disk_file: RawFile = RawFile::new(TempFile::new().unwrap().into_file(), false);
+        header
+            .write_to(&mut disk_file)
+            .expect("Failed to write header to shm.");
+        disk_file.rewind().unwrap();
+        // The maximum nesting depth is 0, which means backing file is not allowed.
+        let res = QcowFile::from_with_nesting_depth(disk_file, 0);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn disable_backing_file() {
+        // `backing_file` is `Some`
+        let header =
+            QcowHeader::create_for_size_and_path(3, 0x10_0000, Some("/path/to/backing/file"))
+                .expect("Failed to create header.");
+        let mut disk_file: RawFile = RawFile::new(TempFile::new().unwrap().into_file(), false);
+        header
+            .write_to(&mut disk_file)
+            .expect("Failed to write header to shm.");
+        disk_file.rewind().unwrap();
+        // The maximum nesting depth is 0, which means backing file is not allowed.
+        let res = QcowFile::from_with_nesting_depth(disk_file, 0);
+        assert!(res.is_err());
+        assert!(matches!(res.unwrap_err(), Error::MaxNestingDepthExceeded));
+    }
+
+    /// Create a qcow2 file with itself as its backing file.
+    ///
+    /// Without configuration `max_nesting_depth`, this will cause infinite recursion when loading
+    /// the file until stack overflow.
+    fn new_self_referential_qcow(path: &Path) -> Result<()> {
+        let header = QcowHeader::create_for_size_and_path(3, 0x10_0000, path.to_str())?;
+        let mut disk_file = RawFile::new(
+            File::create(path).expect("Failed to create image file."),
+            false,
+        );
+        header.write_to(&mut disk_file)?;
+        Ok(())
+    }
+
+    #[test]
+    fn max_nesting_backing() {
+        let test_dir = TempDir::new_with_prefix("/tmp/ch").unwrap();
+        let img_path = test_dir.as_path().join("test.img");
+
+        new_self_referential_qcow(img_path.as_path()).unwrap();
+
+        let err = QcowFile::from_with_nesting_depth(
+            RawFile::new(
+                File::open(img_path.as_path()).expect("Failed to open qcow image file"),
+                false,
+            ),
+            MAX_NESTING_DEPTH,
+        )
+        .expect_err("Opening qcow file with itself as backing file should fail.");
+
+        // This type of error is complex. For comparing easily, we can check if it contains the
+        // type name after formatting.
+        assert!(format!("{err:?}").contains(&format!("{:?}", Error::MaxNestingDepthExceeded)));
+        // This should recursively call the function ten times before throwing an error, and the
+        // error `BackingFileOpen` should also be repeated ten times.
+        assert_eq!(
+            format!("{err:?}")
+                .matches("BackingFileOpen")
+                .collect::<Vec<_>>()
+                .len() as u32,
+            MAX_NESTING_DEPTH,
+        );
     }
 
     #[test]

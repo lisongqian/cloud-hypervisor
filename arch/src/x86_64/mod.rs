@@ -577,7 +577,7 @@ impl CpuidFeatureEntry {
             if !entry_compatible {
                 error!(
                     "Detected incompatible CPUID entry: leaf={:#02x} (subleaf={:#02x}), register='{:?}', \
-                    compatilbe_check='{:?}', source VM feature='{:#04x}', destination VM feature'{:#04x}'.",
+                    compatible_check='{:?}', source VM feature='{:#04x}', destination VM feature'{:#04x}'.",
                     entry.function, entry.index, entry.feature_reg,
                     entry.compatible_check, src_vm_feature, dest_vm_feature
                     );
@@ -699,6 +699,20 @@ pub fn generate_common_cpuid(
                         entry.ecx |= (caps.xfam_fixed1 as u32) & (xss_mask as u32);
                         entry.edx &= ((caps.xfam_fixed0 & xss_mask) >> 32) as u32;
                         entry.edx |= ((caps.xfam_fixed1 & xss_mask) >> 32) as u32;
+                    }
+                }
+            }
+            // Copy host L1 cache details if not populated by KVM
+            0x8000_0005 => {
+                if entry.eax == 0 && entry.ebx == 0 && entry.ecx == 0 && entry.edx == 0 {
+                    // SAFETY: cpuid called with valid leaves
+                    if unsafe { std::arch::x86_64::__cpuid(0x8000_0000).eax } >= 0x8000_0005 {
+                        // SAFETY: cpuid called with valid leaves
+                        let leaf = unsafe { std::arch::x86_64::__cpuid(0x8000_0005) };
+                        entry.eax = leaf.eax;
+                        entry.ebx = leaf.ebx;
+                        entry.ecx = leaf.ecx;
+                        entry.edx = leaf.edx;
                     }
                 }
             }
