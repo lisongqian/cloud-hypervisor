@@ -52,10 +52,9 @@ jobs:
         if: ${{ github.event_name != 'pull_request' || (matrix.runner == 'garm-jammy' && matrix.libc == 'gnu') }}
         timeout-minutes: 20
         run: scripts/dev_cli.sh tests --integration-live-migration --libc ${{ matrix.libc }}
-      - name: Run Grcov
-        if: ${{ github.event_name != 'pull_request' || (matrix.runner == 'garm-jammy' && matrix.libc == 'gnu') }}
-        #        uses: actions-rs/grcov@v0.1
-        run: scripts/dev_cli.sh tests --coverage --libc ${{ matrix.libc }}
+#      - name: Run Grcov
+#        if: ${{ github.event_name != 'pull_request' || (matrix.runner == 'garm-jammy' && matrix.libc == 'gnu') }}
+#        run: scripts/dev_cli.sh tests --coverage
       - name: Upload coverage reports to Codecov
         if: ${{ github.event_name != 'pull_request' || (matrix.runner == 'garm-jammy' && matrix.libc == 'gnu') }}
         uses: codecov/codecov-action@v4

@@ -193,4 +193,16 @@ if [ $RES -eq 0 ]; then
     RES=$?
 fi
 
+# test for code coverage
+
+sudo apt -y install build-essential
+# rustc >= 1.74
+cargo install grcov
+rustup component add llvm-tools-preview
+
+rm lcov.info
+# Generate lcov report
+grcov . -s . --binary-path "./$BUILD_TARGET/release/" -t lcov --branch --ignore-not-existing -o lcov.info
+
+
 exit $RES
