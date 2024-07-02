@@ -3,6 +3,9 @@ on: [pull_request, merge_group]
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+env:
+  RUSTFLAGS: "-Cinstrument-coverage"
+  LLVM_PROFILE_FILE: "ch-%p-%m.profraw"
 
 jobs:
   build:
@@ -47,6 +50,15 @@ jobs:
         if: ${{ github.event_name != 'pull_request' || (matrix.runner == 'garm-jammy' && matrix.libc == 'gnu') }}
         timeout-minutes: 20
         run: scripts/dev_cli.sh tests --integration-live-migration --libc ${{ matrix.libc }}
+      - name: Export Coverage data
+        if: ${{ github.event_name != 'pull_request' || (matrix.runner == 'garm-jammy' && matrix.libc == 'gnu') }}
+        run: scripts/dev_cli.sh tests --coverage --libc ${{ matrix.libc }} -- -- lcov
+      - name: Upload Artifact
+        if: ${{ github.event_name != 'pull_request' || (matrix.runner == 'garm-jammy' && matrix.libc == 'gnu') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-x86_64
+          path: coverage-x86_64.info
       - name: Skipping build for PR
         if: ${{ github.event_name == 'pull_request' && matrix.runner != 'garm-jammy' && matrix.libc != 'gnu' }}
         run: echo "Skipping build for PR"

@@ -32,7 +32,7 @@ as much as possible.
 Raw data files can be combined with `llvm-profdata`.
 
 ```shell
-rustup component add llvm-tools-preview
+rustup component add llvm-tools
 # Assuming profraw files reside in the current directory and its children directories
 find . -name '*.profraw' -exec llvm-profdata merge -sparse {} -o coverage.profdata \;
 ```
