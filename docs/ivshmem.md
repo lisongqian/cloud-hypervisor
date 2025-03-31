@@ -55,11 +55,11 @@ typedef struct ivshmem_device {
 
 static ivshmem_device ivshmem_dev;
 
-tatic struct pci_device_id cube_ivshmem_id_table[] = {
+tatic struct pci_device_id ivshmem_id_table[] = {
 { 0x1af4, 0x1110, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 },
 { 0 },
 };
-MODULE_DEVICE_TABLE (pci, cube_ivshmem_id_table);
+MODULE_DEVICE_TABLE (pci, ivshmem_id_table);
 
 static int ivshmem_probe_device (struct pci_dev *pdev, const struct pci_device_id * ent)
 {
