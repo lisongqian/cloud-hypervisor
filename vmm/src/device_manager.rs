@@ -105,10 +105,12 @@ use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
 use crate::memory_manager::{Error as MemoryManagerError, MemoryManager, MEMORY_MANAGER_ACPI_SIZE};
 use crate::pci_segment::PciSegment;
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
+#[cfg(feature = "ivshmem")]
+use crate::vm_config::IvshmemConfig;
 use crate::vm_config::{
-    ConsoleOutputMode, DeviceConfig, DiskConfig, FsConfig, IvshmemConfig, NetConfig, PmemConfig,
-    UserDeviceConfig, VdpaConfig, VhostMode, VmConfig, VsockConfig,
-    DEFAULT_IOMMU_ADDRESS_WIDTH_BITS, DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
+    ConsoleOutputMode, DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, UserDeviceConfig,
+    VdpaConfig, VhostMode, VmConfig, VsockConfig, DEFAULT_IOMMU_ADDRESS_WIDTH_BITS,
+    DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
 };
 use crate::{device_node, GuestRegionMmap, PciDeviceInfo, DEVICE_MANAGER_SNAPSHOT_ID};
 
@@ -130,6 +132,7 @@ const PVMEMCONTROL_DEVICE_NAME: &str = "__pvmemcontrol";
 const BALLOON_DEVICE_NAME: &str = "__balloon";
 const CONSOLE_DEVICE_NAME: &str = "__console";
 const PVPANIC_DEVICE_NAME: &str = "__pvpanic";
+#[cfg(feature = "ivshmem")]
 const IVSHMEM_DEVICE_NAME: &str = "__ivshmem";
 
 // Devices that the user may name and for which we generate
@@ -505,6 +508,7 @@ pub enum DeviceManagerError {
     /// Cannot create a PvPanic device
     PvPanicCreate(devices::pvpanic::PvPanicError),
 
+    #[cfg(feature = "ivshmem")]
     /// Cannot create a Ivshmem device
     IvshmemCreate(devices::ivshmem::IvshmemError),
 
@@ -943,6 +947,7 @@ pub struct DeviceManager {
 
     mmio_regions: Arc<Mutex<Vec<MmioRegion>>>,
 
+    #[cfg(feature = "ivshmem")]
     // ivshmem device
     ivshmem_device: Option<Arc<Mutex<devices::IvshmemDevice>>>,
 }
@@ -1208,6 +1213,7 @@ impl DeviceManager {
             snapshot,
             rate_limit_groups,
             mmio_regions: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(feature = "ivshmem")]
             ivshmem_device: None,
         };
 
@@ -1327,6 +1333,7 @@ impl DeviceManager {
             self.pvpanic_device = self.add_pvpanic_device()?;
         }
 
+        #[cfg(feature = "ivshmem")]
         if let Some(ivshmem) = self.config.clone().lock().unwrap().ivshmem.as_ref() {
             self.ivshmem_device = self.add_ivshmem_device(ivshmem)?;
         }
@@ -3961,6 +3968,7 @@ impl DeviceManager {
         Ok(Some(pvpanic_device))
     }
 
+    #[cfg(feature = "ivshmem")]
     fn add_ivshmem_device(
         &mut self,
         ivshmem_cfg: &IvshmemConfig,
