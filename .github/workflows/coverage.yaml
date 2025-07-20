@@ -8,7 +8,7 @@ concurrency:
 
 
 jobs:
-  download:
+  upload_coverage:
     runs-on: ubuntu-latest
     steps:
       - name: Code checkout
