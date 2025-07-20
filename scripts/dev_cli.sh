@@ -410,6 +410,8 @@ cmd_tests() {
     if [[ "$unit" = true ]]; then
         say "Running unit tests for $target..."
         $DOCKER_RUNTIME run \
+            -e http_proxy="http://172.0.0.1:7890" \
+            -e https_proxy="http://172.0.0.1:7890" \
             --workdir "$CTR_CLH_ROOT_DIR" \
             --rm \
             --device $exported_device \
