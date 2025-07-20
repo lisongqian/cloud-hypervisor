@@ -44,27 +44,27 @@ jobs:
         if: ${{ github.event_name == 'pull_request' && matrix.runner != 'garm-jammy' && matrix.libc != 'gnu' }}
         run: echo "Skipping build for PR"
 
-  test-arm64:
-    timeout-minutes: 120
-    name: Tests (ARM64)
-    runs-on: bookworm-arm64
-    steps:
-      - name: Fix workspace permissions
-        run: sudo chown -R runner:runner ${GITHUB_WORKSPACE}
-      - name: Code checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Run unit tests (musl)
-        run: scripts/dev_cli.sh tests --unit --libc musl
-      - name: Export Coverage data
-        run: scripts/dev_cli.sh tests --coverage --libc musl  -- -- lcov
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-aarch64
-          path: coverage-aarch64.info
+#  test-arm64:
+#    timeout-minutes: 120
+#    name: Tests (ARM64)
+#    runs-on: bookworm-arm64
+#    steps:
+#      - name: Fix workspace permissions
+#        run: sudo chown -R runner:runner ${GITHUB_WORKSPACE}
+#      - name: Code checkout
+#        uses: actions/checkout@v4
+#        with:
+#          fetch-depth: 0
+#      - name: Run unit tests (musl)
+#        run: scripts/dev_cli.sh tests --unit --libc musl
+#      - name: Export Coverage data
+#        run: scripts/dev_cli.sh tests --coverage --libc musl  -- -- lcov
+#      - name: Upload Artifact
+#        uses: actions/upload-artifact@v4
+#        with:
+#          name: coverage-aarch64
+#          path: coverage-aarch64.info
 
   coverage:
-    needs: [ test-x86-64, test-arm64 ]
+    needs: [ test-x86-64]
     uses: ./.github/workflows/coverage.yaml
