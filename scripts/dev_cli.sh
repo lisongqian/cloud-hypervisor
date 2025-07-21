@@ -429,6 +429,7 @@ cmd_tests() {
         say "Running integration tests for $target..."
         $DOCKER_RUNTIME run \
             --workdir "$CTR_CLH_ROOT_DIR" \
+            -t \
             --rm \
             --privileged \
             --security-opt seccomp=unconfined \
