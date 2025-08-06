@@ -598,7 +598,7 @@ cmd_tests() {
             --security-opt seccomp=unconfined \
             --ipc=host \
             --net="$CTR_CLH_NET" \
-            --mount type=tmpfs,destination=/tmp \
+            --tmpfs /tmp:exec \
             --volume /dev:/dev \
             --volume "$CLH_ROOT_DIR:$CTR_CLH_ROOT_DIR" \
             ${exported_volumes:+"$exported_volumes"} \

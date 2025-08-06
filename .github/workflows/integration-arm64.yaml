@@ -3,6 +3,9 @@ on: [pull_request, merge_group]
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+env:
+  RUSTFLAGS: "-Cinstrument-coverage"
+  LLVM_PROFILE_FILE: "ch-%p-%m.profraw"
 
 jobs:
   build:
@@ -52,3 +55,10 @@ jobs:
         if: ${{ github.event_name != 'pull_request' }}
         timeout-minutes: 30
         run: scripts/dev_cli.sh tests --integration-windows --libc musl
+      - name: Export Coverage data
+        run: scripts/dev_cli.sh tests --coverage --libc musl  -- -- lcov
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-aarch64
+          path: coverage-aarch64.info

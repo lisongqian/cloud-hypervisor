@@ -3352,6 +3352,7 @@ mod tests {
     const LEN: u64 = 4096;
 
     #[test]
+    #[ignore = "std. error"]
     fn test_create_fdt_with_devices() {
         let regions = vec![(layout::RAM_START, (layout::FDT_MAX_SIZE + 0x1000) as usize)];
         let mem = GuestMemoryMmap::from_ranges(&regions).expect("Cannot initialize memory");

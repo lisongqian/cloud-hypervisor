@@ -15,23 +15,25 @@ pushd $PROJECT_DIR || exit
 
 export BUILD_TARGET=${BUILD_TARGET-$(uname -m)-unknown-linux-gnu}
 
+cargo install grcov
 # GLIBC > 2.31
-GRCOV_RELEASE_URL="https://github.com/mozilla/grcov/releases/download/v0.8.19/grcov-$BUILD_TARGET.tar.bz2"
-wget --quiet "$GRCOV_RELEASE_URL" || exit 1
-tar -xjf "grcov-$BUILD_TARGET.tar.bz2"
+#GRCOV_RELEASE_URL="https://github.com/mozilla/grcov/releases/download/v0.8.19/grcov-$BUILD_TARGET.tar.bz2"
+#wget --quiet "$GRCOV_RELEASE_URL" || exit 1
+#tar -xjf "grcov-$BUILD_TARGET.tar.bz2"
 
-rustup component add llvm-tools-preview
+rustup component add llvm-tools
 
 export_lcov() {
-    rm "coverage.info"
+    export_file="coverage-$(uname -m).info"
+    rm $export_file
 
-    ./grcov "$(find . -name 'ch-*.profraw' -print)" -s . \
+    grcov "$(find . -name 'ch-*.profraw' -print)" -s . \
         --ignore "tests/*" \
         --ignore "test_infra/*" \
         --ignore "performance-metrics/*" \
         --binary-path "$TARGET_DIR/$BUILD_TARGET/release/" \
         --branch --ignore-not-existing -t lcov \
-        -o "coverage.info"
+        -o $export_file
 
     find . -type f -name 'ch-*.profraw' -exec rm {} \;
 }
@@ -40,7 +42,7 @@ export_lcov() {
 export_html() {
     OUTPUT_DIR="$TARGET_DIR/coverage"
     rm -rf $OUTPUT_DIR
-    ./grcov "$(find . -name 'ch-*.profraw' -print)" -s . \
+    grcov "$(find . -name 'ch-*.profraw' -print)" -s . \
         --ignore "tests/*" \
         --ignore "test_infra/*" \
         --ignore "performance-metrics/*" \
